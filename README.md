@@ -1,6 +1,6 @@
 # extract-software-repos
 
-Extract and validate software repository URLs from scientific papers, with ML-powered promotion to identify official implementations.
+Extract and validate software repository URLs from scientific papers, with ML-powered promotion to identify official implementations. Author matching model derived from [sci-soft-models](https://github.com/evamaxfield/sci-soft-models) by Eva Maxfield Brown ([doi:10.5281/zenodo.17401862](https://doi.org/10.5281/zenodo.17401862)), as described in [Code Contribution and Credit in Science](https://doi.org/10.48550/arXiv.2510.16242).
 
 ## Installation
 
@@ -53,7 +53,7 @@ datacite-enrich merge records.jsonl.gz enrichments_final.jsonl -o merged.jsonl
 
 ## Acknowledgments
 
-The author matching model and inference code are adapted from work by Eva Maxfield Brown:
+The author matching model and inference code are derived from work by Eva Maxfield Brown:
 
 **Code Repository:**
 Brown, E. M. (2025). sci-soft-models [Computer software]. GitHub. https://github.com/evamaxfield/sci-soft-models
