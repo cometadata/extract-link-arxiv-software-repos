@@ -1,0 +1,922 @@
+"""CLI commands for software URL extraction and validation."""
+
+import gzip
+import json
+import logging
+from pathlib import Path
+from typing import Iterator, Optional
+
+import click
+
+logger = logging.getLogger(__name__)
+
+
+def _setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+
+def _stream_jsonl(path: Path) -> Iterator[dict]:
+    """Stream JSONL or JSONL.gz file."""
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+@click.group()
+@click.version_option()
+def cli():
+    """Extract and validate software repository URLs."""
+    pass
+
+
+@cli.command("extract")
+@click.argument("input_file", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--from-datacite-abstract",
+    "source_type",
+    flag_value="datacite",
+    help="Extract from DataCite record abstracts (JSONL input)"
+)
+@click.option(
+    "--from-parquet",
+    "source_type",
+    flag_value="parquet",
+    default=True,
+    help="Extract from parquet fulltext (default)"
+)
+@click.option(
+    "--output", "-o",
+    type=click.Path(path_type=Path),
+    help="Output JSONL file (default: <input>_enrichments.jsonl)"
+)
+@click.option(
+    "--chunk-size", "-c",
+    type=int,
+    default=50000,
+    help="Rows per chunk for parquet (default: 50000)"
+)
+@click.option(
+    "--id-field",
+    type=str,
+    default="relative_path",
+    help="Column containing ID (default: relative_path)"
+)
+@click.option(
+    "--content-field",
+    type=str,
+    default="content",
+    help="Column containing text (default: content)"
+)
+@click.option(
+    "--heal-fulltext",
+    is_flag=True,
+    help="Preprocess text through markdown healing before extraction"
+)
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
+    default="INFO",
+    help="Logging level"
+)
+def extract(
+    input_file: Path,
+    source_type: str,
+    output: Optional[Path],
+    chunk_size: int,
+    id_field: str,
+    content_field: str,
+    heal_fulltext: bool,
+    log_level: str,
+):
+    """Extract software repository URLs from text.
+
+    INPUT_FILE: Path to input file (parquet or JSONL)
+
+    Examples:
+        extract-software-repos extract papers.parquet -o enrichments.jsonl
+        extract-software-repos extract records.jsonl.gz --from-datacite-abstract
+    """
+    _setup_logging(log_level)
+
+    if output is None:
+        output = input_file.parent / f"{input_file.stem}_enrichments.jsonl"
+
+    if source_type == "datacite":
+        _extract_datacite(input_file, output)
+    else:
+        _extract_parquet(input_file, output, chunk_size, id_field, content_field, heal_fulltext)
+
+
+def _extract_datacite(input_file: Path, output: Path):
+    from .processing import process_record
+
+    click.echo(f"Extracting from DataCite abstracts: {input_file}")
+    click.echo(f"Output: {output}")
+
+    total_records = 0
+    total_enrichments = 0
+
+    with open(output, "w", encoding="utf-8") as out_f:
+        for record in _stream_jsonl(input_file):
+            total_records += 1
+
+            enrichments = process_record(record)
+            for enrichment in enrichments:
+                out_f.write(json.dumps(enrichment, ensure_ascii=False) + "\n")
+                total_enrichments += 1
+
+            if total_records % 10000 == 0:
+                click.echo(f"  Processed {total_records:,} records, {total_enrichments:,} enrichments...")
+
+    click.echo("\nExtraction complete!")
+    click.echo(f"  Records processed: {total_records:,}")
+    click.echo(f"  Enrichments created: {total_enrichments:,}")
+    click.echo(f"  Output: {output}")
+
+
+def _extract_parquet(
+    input_file: Path,
+    output: Path,
+    chunk_size: int,
+    id_field: str,
+    content_field: str,
+    heal_fulltext: bool,
+):
+    import polars as pl
+    from tqdm import tqdm
+    from .polars_extraction import process_parquet_polars
+
+    heal_status = " (with fulltext healing)" if heal_fulltext else ""
+    click.echo(f"Extracting from parquet: {input_file}{heal_status}")
+    click.echo(f"Output: {output}")
+
+    total_rows = pl.scan_parquet(input_file).select(pl.len()).collect().item()
+
+    pbar = tqdm(total=total_rows, desc="Processing", unit="docs")
+    last_processed = 0
+
+    def progress_callback(papers_processed, papers_with_urls, total_urls):
+        nonlocal last_processed
+        pbar.update(papers_processed - last_processed)
+        last_processed = papers_processed
+        pbar.set_postfix({"with_urls": papers_with_urls, "urls": total_urls})
+
+    stats = process_parquet_polars(
+        input_file,
+        output,
+        id_field=id_field,
+        content_field=content_field,
+        chunk_size=chunk_size,
+        heal_fulltext=heal_fulltext,
+        progress_callback=progress_callback,
+    )
+
+    pbar.close()
+
+    click.echo("\nExtraction complete!")
+    click.echo(f"  Total documents: {stats['total_papers']:,}")
+    click.echo(f"  With URLs: {stats['papers_with_urls']:,}")
+    click.echo(f"  Total enrichments: {stats['total_urls']:,}")
+
+    if heal_fulltext and stats.get("healing_warnings", 0) > 0:
+        click.echo(f"  Healing warnings: {stats['healing_warnings']:,} documents")
+
+    if stats["urls_by_type"]:
+        click.echo("  By type:")
+        for url_type, count in sorted(stats["urls_by_type"].items(), key=lambda x: -x[1]):
+            click.echo(f"    {url_type}: {count:,}")
+
+    click.echo(f"  Output: {output}")
+
+
+@cli.command("validate")
+@click.argument("input_file", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--output", "-o",
+    type=click.Path(path_type=Path),
+    help="Output file (default: <input>_validated.jsonl)"
+)
+@click.option(
+    "--workers", "-w",
+    type=int,
+    default=50,
+    help="Number of parallel workers for git ls-remote (default: 50)"
+)
+@click.option(
+    "--http-concurrency",
+    type=int,
+    default=100,
+    help="Max concurrent HTTP requests (default: 100)"
+)
+@click.option(
+    "--timeout", "-t",
+    type=int,
+    default=5,
+    help="Timeout per request in seconds (default: 5)"
+)
+@click.option(
+    "--checkpoint",
+    type=click.Path(path_type=Path),
+    default=Path("validation_cache.jsonl"),
+    help="Checkpoint file for resume (default: validation_cache.jsonl)"
+)
+@click.option(
+    "--ignore-checkpoint",
+    is_flag=True,
+    help="Start fresh, ignore existing checkpoint"
+)
+@click.option(
+    "--wait-for-ratelimit",
+    is_flag=True,
+    help="Wait when rate limited instead of exiting"
+)
+@click.option(
+    "--keep-invalid",
+    is_flag=True,
+    help="Keep invalid URLs in output (marked as invalid)"
+)
+@click.option(
+    "--promote",
+    is_flag=True,
+    help="Run promotion after validation (requires --records)"
+)
+@click.option(
+    "--records",
+    type=click.Path(exists=True, path_type=Path),
+    help="Paper records file for promotion (JSONL or JSONL.gz)"
+)
+@click.option(
+    "--record-type",
+    type=click.Choice(["datacite"]),
+    default="datacite",
+    help="Record format type (default: datacite)"
+)
+@click.option(
+    "--promotion-threshold",
+    type=int,
+    default=2,
+    help="Minimum heuristic signals for promotion (default: 2)"
+)
+@click.option(
+    "--name-similarity-threshold",
+    type=float,
+    default=0.45,
+    help="Name similarity threshold (default: 0.45)"
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=50,
+    help="GitHub API batch size for promotion (default: 50)"
+)
+@click.option(
+    "--github-cache",
+    type=click.Path(path_type=Path),
+    help="Cache file for GitHub promotion data"
+)
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
+    default="INFO",
+    help="Logging level"
+)
+def validate(
+    input_file: Path,
+    output: Optional[Path],
+    workers: int,
+    http_concurrency: int,
+    timeout: int,
+    checkpoint: Path,
+    ignore_checkpoint: bool,
+    wait_for_ratelimit: bool,
+    keep_invalid: bool,
+    promote: bool,
+    records: Optional[Path],
+    record_type: str,
+    promotion_threshold: int,
+    name_similarity_threshold: float,
+    batch_size: int,
+    github_cache: Optional[Path],
+    log_level: str,
+):
+    """Validate extracted URLs against their sources.
+
+    INPUT_FILE: Enrichment JSONL file to validate
+
+    Uses GitHub GraphQL API (batched) for GitHub URLs, async HTTP for
+    package registries, and git ls-remote for other git hosts.
+
+    Requires GITHUB_TOKEN environment variable for GitHub validation.
+
+    Example:
+        export GITHUB_TOKEN=ghp_xxxx
+        extract-software-repos validate enrichments.jsonl -o validated.jsonl
+    """
+    import asyncio
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime, timezone
+    from typing import Any, Dict
+
+    from tqdm import tqdm
+    from .validation import deduplicate_urls, categorize_urls, validate_git_repo
+    from .async_validators import AsyncHTTPValidator
+    from .github_graphql import RateLimitExceeded, TokenScopeError, GitHubPromotionFetcher, GitHubPromotionData, GitHubGraphQLValidator
+    from .checkpoint import CheckpointManager
+
+    _setup_logging(log_level)
+
+    # Validate promote options
+    if promote and not records:
+        raise click.UsageError("--promote requires --records")
+
+    if output is None:
+        if promote:
+            output = input_file.parent / f"{input_file.stem}_validated_promoted.jsonl"
+        else:
+            output = input_file.parent / f"{input_file.stem}_validated.jsonl"
+
+    # Check for GitHub token
+    if not os.environ.get("GITHUB_TOKEN"):
+        click.echo("Warning: GITHUB_TOKEN not set. GitHub validation will fail.", err=True)
+
+    # Handle checkpoint
+    if ignore_checkpoint and checkpoint.exists():
+        click.echo(f"Ignoring existing checkpoint: {checkpoint}")
+        checkpoint.unlink()
+
+    click.echo(f"Validating URLs from {input_file}")
+    if promote:
+        click.echo(f"Promotion enabled with records from {records}")
+    click.echo(f"Checkpoint: {checkpoint}")
+    click.echo(f"Workers: {workers}, HTTP concurrency: {http_concurrency}, Timeout: {timeout}s")
+
+    # Load records
+    input_records = []
+    for line in open(input_file, "r", encoding="utf-8"):
+        line = line.strip()
+        if line:
+            input_records.append(json.loads(line))
+
+    click.echo(f"Loaded {len(input_records):,} enrichment records")
+
+    # Deduplicate URLs
+    unique_urls, url_to_records = deduplicate_urls(input_records)
+    click.echo(f"Unique URLs: {len(unique_urls):,}")
+
+    # Categorize URLs
+    categories = categorize_urls(unique_urls)
+
+    # Set up checkpoint
+    checkpoint_mgr = CheckpointManager(checkpoint)
+    cached = checkpoint_mgr.get_cached_urls()
+
+    # Results storage
+    validation_results: Dict[str, Dict[str, Any]] = {}
+    github_promotion_data: Dict[str, GitHubPromotionData] = {}
+
+    # Progress bars
+    stages = {}
+
+    def progress_callback(stage: str, completed: int, total: int):
+        if stage not in stages:
+            stages[stage] = tqdm(total=total, desc=stage, unit="urls")
+        stages[stage].n = completed
+        stages[stage].refresh()
+
+    try:
+        # Handle GitHub URLs
+        github_urls = categories.get("github", [])
+        github_urls_to_process = [u for u in github_urls if u not in cached]
+
+        if github_urls_to_process:
+            if promote:
+                # Use promotion fetcher for combined validation + promotion data
+                click.echo("Fetching GitHub data (validation + promotion)...")
+
+                # Load cached GitHub promotion data if available
+                if github_cache and github_cache.exists():
+                    for record in _stream_jsonl(github_cache):
+                        data = GitHubPromotionData.from_dict(record)
+                        github_promotion_data[data.url] = data
+                    click.echo(f"Loaded {len(github_promotion_data):,} cached GitHub entries")
+
+                urls_to_fetch = [u for u in github_urls_to_process if u not in github_promotion_data]
+
+                if urls_to_fetch:
+                    cache_file_handle = None
+                    if github_cache:
+                        cache_file_handle = open(github_cache, "a", encoding="utf-8")
+
+                    def save_to_cache(batch_results):
+                        if cache_file_handle:
+                            for data in batch_results:
+                                cache_file_handle.write(json.dumps(data.to_dict(), ensure_ascii=False) + "\n")
+                            cache_file_handle.flush()
+
+                    try:
+                        fetcher = GitHubPromotionFetcher(batch_size=batch_size)
+
+                        async def fetch_all():
+                            return await fetcher.fetch_promotion_data(
+                                urls_to_fetch,
+                                progress_callback=lambda c, t: progress_callback("GitHub (validate+promote)", c, t),
+                                batch_callback=save_to_cache,
+                            )
+
+                        fetched_data = asyncio.run(fetch_all())
+
+                        for data in fetched_data:
+                            github_promotion_data[data.url] = data
+                            # Convert to validation result
+                            is_valid = data.exists
+                            result = {
+                                "url": data.url,
+                                "valid": is_valid,
+                                "method": "graphql_promotion",
+                                "error": data.fetch_error if not is_valid else None,
+                            }
+                            validation_results[data.url] = result
+                            checkpoint_mgr.save_result(data.url, is_valid, "graphql_promotion", data.fetch_error)
+
+                    finally:
+                        if cache_file_handle:
+                            cache_file_handle.close()
+
+                # Add cached GitHub promotion data as validation results
+                for url in github_urls:
+                    if url in cached:
+                        validation_results[url] = cached[url]
+                    elif url in github_promotion_data and url not in validation_results:
+                        data = github_promotion_data[url]
+                        is_valid = data.exists
+                        validation_results[url] = {
+                            "url": url,
+                            "valid": is_valid,
+                            "method": "graphql_promotion",
+                            "error": data.fetch_error if not is_valid else None,
+                        }
+
+            else:
+                # Standard GitHub validation (no promotion)
+                try:
+                    validator = GitHubGraphQLValidator()
+
+                    def save_batch(batch_results):
+                        for r in batch_results:
+                            result = {"url": r.url, "valid": r.valid, "method": "graphql", "error": r.error}
+                            validation_results[r.url] = result
+                            checkpoint_mgr.save_result(r.url, r.valid, "graphql", r.error)
+
+                    asyncio.run(validator.validate_urls(
+                        github_urls_to_process,
+                        lambda c, t: progress_callback("GitHub", c, t),
+                        save_batch,
+                    ))
+
+                except RateLimitExceeded as e:
+                    if wait_for_ratelimit:
+                        import time
+                        wait_seconds = (e.rate_limit.reset_at - datetime.now(timezone.utc)).total_seconds()
+                        click.echo(f"Rate limit exceeded. Waiting {wait_seconds:.0f}s...")
+                        time.sleep(max(0, wait_seconds) + 5)
+                        # Retry would go here
+                    else:
+                        raise
+
+        # Add cached GitHub results
+        for url in github_urls:
+            if url in cached and url not in validation_results:
+                validation_results[url] = cached[url]
+
+        # Handle non-GitHub git repos
+        git_urls = categories.get("gitlab", []) + categories.get("bitbucket", []) + categories.get("codeberg", [])
+        git_urls_to_process = [u for u in git_urls if u not in cached]
+
+        if git_urls_to_process:
+            total = len(git_urls_to_process)
+            completed = 0
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(validate_git_repo, url, timeout): url for url in git_urls_to_process}
+
+                for future in as_completed(futures):
+                    url = futures[future]
+                    is_valid, method, error = future.result()
+                    result = {"url": url, "valid": is_valid, "method": method, "error": error}
+                    validation_results[url] = result
+                    checkpoint_mgr.save_result(url, is_valid, method, error)
+                    completed += 1
+                    progress_callback("Git repos", completed, total)
+
+        # Add cached git results
+        for url in git_urls:
+            if url in cached and url not in validation_results:
+                validation_results[url] = cached[url]
+
+        # Handle HTTP-based URLs
+        http_urls = []
+        for url_type in ["pypi", "npm", "cran", "bioconductor", "zenodo", "figshare", "codeocean", "software_heritage"]:
+            for url in categories.get(url_type, []):
+                if url not in cached:
+                    http_urls.append({"url": url, "type": url_type})
+
+        if http_urls:
+            http_validator = AsyncHTTPValidator(max_concurrency=http_concurrency, timeout=timeout)
+
+            async def validate_http():
+                return await http_validator.validate_urls(
+                    http_urls,
+                    lambda c, t: progress_callback("HTTP", c, t),
+                )
+
+            http_results = asyncio.run(validate_http())
+
+            for r in http_results:
+                validation_results[r["url"]] = r
+            checkpoint_mgr.save_batch(http_results)
+
+        # Add cached HTTP results
+        for url_type in ["pypi", "npm", "cran", "bioconductor", "zenodo", "figshare", "codeocean", "software_heritage"]:
+            for url in categories.get(url_type, []):
+                if url in cached and url not in validation_results:
+                    validation_results[url] = cached[url]
+
+    except TokenScopeError as e:
+        click.echo(f"\n{e}", err=True)
+        click.echo("\nTo fix this, update your GitHub token to include 'read:user' scope.", err=True)
+        raise SystemExit(1)
+    except RateLimitExceeded as e:
+        click.echo(f"\nRate limit exceeded. Resets at {e.rate_limit.reset_at}", err=True)
+        click.echo(f"Progress saved to {checkpoint}. Re-run to continue.", err=True)
+        click.echo("Use --wait-for-ratelimit to auto-wait next time.", err=True)
+        raise SystemExit(1)
+    finally:
+        for pbar in stages.values():
+            pbar.close()
+
+    # Apply validation results to records
+    valid_count = 0
+    invalid_count = 0
+    output_records = []
+
+    for record in input_records:
+        url = record.get("enrichedValue", {}).get("relatedIdentifier")
+        if not url:
+            continue
+
+        result = validation_results.get(url)
+        if not result:
+            continue
+
+        if result.get("valid"):
+            valid_count += 1
+        else:
+            invalid_count += 1
+
+        if result.get("valid") or keep_invalid:
+            record["_validation"] = {
+                "is_valid": result.get("valid"),
+                "method": result.get("method"),
+                "error": result.get("error"),
+            }
+            output_records.append(record)
+
+    click.echo("\nValidation complete!")
+    click.echo(f"  Valid URLs: {valid_count:,}")
+    click.echo(f"  Invalid URLs: {invalid_count:,}")
+
+    # Run promotion if enabled
+    if promote:
+        from .paper_records import load_papers_for_dois, normalize_doi
+        from .promotion import BatchPromotionEngine
+
+        click.echo("\nRunning promotion...")
+
+        # Get DOIs from valid records
+        dois_needed = set()
+        for rec in output_records:
+            if not rec.get("_validation", {}).get("is_valid"):
+                continue
+            doi = rec.get("doi", "")
+            if doi:
+                dois_needed.add(normalize_doi(doi))
+
+        click.echo(f"DOIs to lookup: {len(dois_needed):,}")
+
+        # Load paper records
+        paper_infos = load_papers_for_dois(records, dois_needed, record_type)
+        click.echo(f"Loaded {len(paper_infos):,} matching paper records")
+
+        # Build paper index
+        paper_index = {normalize_doi(p.doi): p for p in paper_infos if p.doi}
+
+        # Initialize batch engine
+        engine = BatchPromotionEngine(
+            promotion_threshold=promotion_threshold,
+            name_similarity_threshold=name_similarity_threshold,
+            chunk_size=1000,
+            model_batch_size=256,
+        )
+
+        # Process in chunks with streaming output
+        promoted_count = 0
+        promoted_urls = set()
+        chunk_size = engine.chunk_size
+
+        with open(output, "w", encoding="utf-8") as f:
+            with tqdm(total=len(output_records), desc="Evaluating promotion", unit="records") as pbar:
+                for chunk_start in range(0, len(output_records), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(output_records))
+                    chunk = output_records[chunk_start:chunk_end]
+
+                    # Process chunk (batched inference inside)
+                    chunk_promoted = engine.process_chunk(
+                        chunk, paper_index, github_promotion_data, promoted_urls
+                    )
+                    promoted_count += chunk_promoted
+
+                    # Stream write for crash resilience
+                    for record in chunk:
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                    pbar.update(len(chunk))
+                    pbar.set_postfix(promoted=promoted_count)
+
+        click.echo(f"  Promoted to IsSupplementedBy: {promoted_count:,}")
+        click.echo(f"  Output: {output} ({len(output_records):,} records)")
+
+    else:
+        with open(output, "w", encoding="utf-8") as f:
+            for record in output_records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        click.echo(f"  Output: {output} ({len(output_records):,} records)")
+
+
+@cli.command("heal-fulltext")
+@click.argument("parquet_file", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--output", "-o",
+    type=click.Path(path_type=Path),
+    help="Output parquet file (default: <input>_healed.parquet)"
+)
+@click.option(
+    "--content-field",
+    type=str,
+    default=None,
+    help="Column containing text (auto-detected if not specified)"
+)
+@click.option(
+    "--workers", "-w",
+    type=int,
+    default=None,
+    help="Number of parallel workers (default: CPU count)"
+)
+@click.option(
+    "--chunk-size", "-c",
+    type=int,
+    default=1000,
+    help="Rows per chunk (default: 1000)"
+)
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
+    default="INFO",
+    help="Logging level"
+)
+def heal_text_cmd(
+    parquet_file: Path,
+    output: Optional[Path],
+    content_field: Optional[str],
+    workers: Optional[int],
+    chunk_size: int,
+    log_level: str,
+):
+    """Heal malformed markdown in parquet file.
+
+    PARQUET_FILE: Path to parquet file with text content.
+
+    Uses multiprocessing for parallel healing across CPU cores.
+
+    Example:
+        extract-software-repos heal-text arxiv.parquet -o cleaned.parquet
+        extract-software-repos heal-text arxiv.parquet --workers 8
+    """
+    import polars as pl
+    from .healing import heal_parquet_parallel
+
+    _setup_logging(log_level)
+
+    if output is None:
+        output = parquet_file.parent / f"{parquet_file.stem}_healed.parquet"
+
+    click.echo(f"Healing text in {parquet_file}")
+    click.echo(f"Output: {output}")
+
+    if content_field is None:
+        df_schema = pl.read_parquet_schema(parquet_file)
+        content_candidates = ['content', 'text', 'markdown', 'md', 'body']
+        for candidate in content_candidates:
+            if candidate in df_schema:
+                content_field = candidate
+                break
+
+    if content_field is None:
+        df_schema = pl.read_parquet_schema(parquet_file)
+        click.echo(f"Error: Could not detect content column. Available: {list(df_schema.keys())}")
+        raise SystemExit(1)
+
+    click.echo(f"Using content column: {content_field}")
+
+    total_rows = pl.scan_parquet(parquet_file).select(pl.len()).collect().item()
+    click.echo(f"Processing {total_rows:,} documents...")
+
+    from multiprocessing import cpu_count
+    actual_workers = workers or cpu_count()
+    click.echo(f"Using {actual_workers} parallel workers")
+
+    stats = heal_parquet_parallel(
+        parquet_file,
+        output,
+        content_field=content_field,
+        workers=workers,
+        chunk_size=chunk_size,
+    )
+
+    click.echo("\nHealing complete!")
+    click.echo(f"  Total documents:     {stats['total']:,}")
+    click.echo(f"  Successfully healed: {stats['healed']:,}")
+    click.echo(f"  With warnings:       {stats['warnings']:,}")
+    click.echo(f"  Output: {output}")
+
+
+@cli.command("promote")
+@click.argument("input_file", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--records",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Paper records file (JSONL or JSONL.gz)"
+)
+@click.option(
+    "--record-type",
+    type=click.Choice(["datacite"]),
+    default="datacite",
+    help="Record format type (default: datacite)"
+)
+@click.option(
+    "--output", "-o",
+    type=click.Path(path_type=Path),
+    help="Output file (default: <input>_promoted.jsonl)"
+)
+@click.option(
+    "--promotion-threshold",
+    type=int,
+    default=2,
+    help="Minimum heuristic signals for promotion (default: 2)"
+)
+@click.option(
+    "--name-similarity-threshold",
+    type=float,
+    default=0.45,
+    help="Name similarity threshold (default: 0.45)"
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=50,
+    help="GitHub API batch size (default: 50)"
+)
+@click.option(
+    "--github-cache",
+    type=click.Path(path_type=Path),
+    help="Cache file for GitHub data (saves/resumes fetching)"
+)
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
+    default="INFO",
+    help="Logging level"
+)
+def promote_cmd(
+    input_file: Path,
+    records: Path,
+    record_type: str,
+    output: Optional[Path],
+    promotion_threshold: int,
+    name_similarity_threshold: float,
+    batch_size: int,
+    github_cache: Optional[Path],
+    log_level: str,
+):
+    """Promote validated repo links to isSupplementedBy.
+
+    INPUT_FILE: Validated enrichment JSONL file
+
+    Uses heuristics to identify repos that are the paper's official
+    implementation: arXiv ID in README, name similarity, author matching.
+
+    Requires GITHUB_TOKEN environment variable.
+
+    Example:
+        export GITHUB_TOKEN=ghp_xxxx
+        extract-software-repos promote validated.jsonl --records papers.jsonl.gz
+    """
+    import os
+    from tqdm import tqdm
+    from .paper_records import load_papers_for_dois, normalize_doi
+    from .promotion import PromotionEngine
+    from .github_graphql import GitHubPromotionData
+
+    _setup_logging(log_level)
+
+    if output is None:
+        output = input_file.parent / f"{input_file.stem}_promoted.jsonl"
+
+    if not os.environ.get("GITHUB_TOKEN"):
+        click.echo("Error: GITHUB_TOKEN not set", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"Promoting records from {input_file}")
+    click.echo(f"Paper records: {records}")
+    click.echo(f"Output: {output}")
+
+    enrichment_records = list(_stream_jsonl(input_file))
+    click.echo(f"Loaded {len(enrichment_records):,} enrichment records")
+
+    dois_needed = set()
+    for rec in enrichment_records:
+        doi = rec.get("doi", "")
+        if doi:
+            dois_needed.add(normalize_doi(doi))
+    click.echo(f"Unique DOIs to lookup: {len(dois_needed):,}")
+
+    paper_infos = load_papers_for_dois(records, dois_needed, record_type)
+    click.echo(f"Loaded {len(paper_infos):,} matching paper records")
+
+    cached_github_data = {}
+    cache_file_handle = None
+
+    if github_cache:
+        if github_cache.exists():
+            for record in _stream_jsonl(github_cache):
+                data = GitHubPromotionData.from_dict(record)
+                cached_github_data[data.url] = data
+            click.echo(f"Loaded {len(cached_github_data):,} cached GitHub entries")
+        cache_file_handle = open(github_cache, "a", encoding="utf-8")
+
+    def save_to_cache(batch_results):
+        if cache_file_handle:
+            for data in batch_results:
+                cache_file_handle.write(json.dumps(data.to_dict(), ensure_ascii=False) + "\n")
+            cache_file_handle.flush()
+
+    engine = PromotionEngine(
+        promotion_threshold=promotion_threshold,
+        name_similarity_threshold=name_similarity_threshold,
+        batch_size=batch_size,
+    )
+
+    stages = {}
+
+    def progress_callback(stage: str, completed: int, total: int):
+        if stage not in stages:
+            stages[stage] = tqdm(total=total, desc=stage, unit="items")
+        stages[stage].n = completed
+        stages[stage].refresh()
+
+    try:
+        output_records = engine.promote_records_sync(
+            enrichment_records,
+            paper_infos,
+            progress_callback,
+            cached_github_data=cached_github_data if cached_github_data else None,
+            github_data_callback=save_to_cache if github_cache else None,
+        )
+    finally:
+        for pbar in stages.values():
+            pbar.close()
+        if cache_file_handle:
+            cache_file_handle.close()
+
+    # Write output
+    with open(output, "w", encoding="utf-8") as f:
+        for record in output_records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    promoted_count = sum(1 for r in output_records if r.get("_promotion", {}).get("promoted"))
+
+    click.echo("\nPromotion complete!")
+    click.echo(f"  Total records: {len(output_records):,}")
+    click.echo(f"  Promoted to isSupplementedBy: {promoted_count:,}")
+    click.echo(f"  Output: {output}")
+
+
+if __name__ == "__main__":
+    cli()

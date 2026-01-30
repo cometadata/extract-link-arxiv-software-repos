@@ -1,0 +1,548 @@
+"""GitHub GraphQL batch validation."""
+
+import asyncio
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import aiohttp
+
+logger = logging.getLogger(__name__)
+
+GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+BATCH_SIZE = 100  # Max repos per query
+MIN_BATCH_INTERVAL = 3.0  # Seconds between batches to stay under 2000 points/min
+
+
+def parse_github_url(url: str) -> Optional[Tuple[str, str]]:
+    """Return (owner, repo) tuple or None if URL is invalid."""
+    pattern = r"github\.com/([^/]+)/([^/?#]+)"
+    match = re.search(pattern, url)
+
+    if not match:
+        return None
+
+    owner = match.group(1)
+    repo = match.group(2)
+
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+
+    return (owner, repo)
+
+
+def build_graphql_query(repos: List[Tuple[str, str]]) -> str:
+    parts = []
+    for i, (owner, repo) in enumerate(repos):
+        owner_escaped = owner.replace('"', '\\"')
+        repo_escaped = repo.replace('"', '\\"')
+        parts.append(f'repo{i}: repository(owner: "{owner_escaped}", name: "{repo_escaped}") {{ id }}')
+
+    return "query { " + " ".join(parts) + " }"
+
+
+@dataclass
+class RateLimitInfo:
+    remaining: int
+    reset_at: datetime
+    limit: int
+
+
+@dataclass
+class GitHubValidationResult:
+    url: str
+    valid: bool
+    error: Optional[str] = None
+
+
+@dataclass
+class GitHubPromotionData:
+    url: str
+    description: Optional[str] = None
+    readme_content: Optional[str] = None
+    contributors: List[Dict[str, Any]] = field(default_factory=list)
+    fetch_error: Optional[str] = None
+
+    @property
+    def exists(self) -> bool:
+        return self.fetch_error is None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "url": self.url,
+            "description": self.description,
+            "readme_content": self.readme_content,
+            "contributors": self.contributors,
+            "fetch_error": self.fetch_error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GitHubPromotionData":
+        return cls(
+            url=data["url"],
+            description=data.get("description"),
+            readme_content=data.get("readme_content"),
+            contributors=data.get("contributors", []),
+            fetch_error=data.get("fetch_error"),
+        )
+
+
+def build_promotion_query(repos: List[Tuple[str, str]]) -> str:
+    """Fetch description, README (multiple variants), and contributors."""
+    parts = []
+    for i, (owner, repo) in enumerate(repos):
+        owner_escaped = owner.replace('"', '\\"')
+        repo_escaped = repo.replace('"', '\\"')
+        parts.append(f'''
+            repo{i}: repository(owner: "{owner_escaped}", name: "{repo_escaped}") {{
+                description
+                readme_md: object(expression: "HEAD:README.md") {{ ... on Blob {{ text }} }}
+                readme_rst: object(expression: "HEAD:README.rst") {{ ... on Blob {{ text }} }}
+                readme_txt: object(expression: "HEAD:README.txt") {{ ... on Blob {{ text }} }}
+                readme_plain: object(expression: "HEAD:README") {{ ... on Blob {{ text }} }}
+                mentionableUsers(first: 100) {{
+                    nodes {{
+                        login
+                        name
+                        email
+                    }}
+                }}
+            }}
+        ''')
+
+    return "query { " + " ".join(parts) + " }"
+
+
+PROMOTION_BATCH_SIZE = 50  # Smaller batch for heavier queries
+
+PREFLIGHT_QUERY = """query {
+    viewer { login }
+    repository(owner: "octocat", name: "Hello-World") {
+        description
+        readme_md: object(expression: "HEAD:README.md") { ... on Blob { text } }
+        mentionableUsers(first: 1) {
+            nodes { login name email }
+        }
+    }
+}"""
+
+
+class TokenScopeError(Exception):
+    def __init__(self, message: str, required_scopes: List[str], current_scopes: List[str]):
+        self.required_scopes = required_scopes
+        self.current_scopes = current_scopes
+        super().__init__(message)
+
+
+class GitHubPromotionFetcher:
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        batch_size: int = PROMOTION_BATCH_SIZE,
+        max_retries: int = 3,
+    ):
+        self.token = token or os.environ.get("GITHUB_TOKEN")
+        if not self.token:
+            raise ValueError("GitHub token required. Set GITHUB_TOKEN environment variable.")
+
+        self.batch_size = batch_size
+        self.max_retries = max_retries
+        self.rate_limit: Optional[RateLimitInfo] = None
+        self._preflight_passed = False
+
+    async def preflight_check(self, session: Optional[aiohttp.ClientSession] = None) -> None:
+        """Raises TokenScopeError if token lacks required scopes, ValueError if invalid."""
+        close_session = False
+        if session is None:
+            session = aiohttp.ClientSession()
+            close_session = True
+
+        try:
+            async with session.post(
+                GITHUB_GRAPHQL_URL,
+                json={"query": PREFLIGHT_QUERY},
+                headers=self._get_headers(),
+            ) as response:
+                if response.status == 401:
+                    raise ValueError("Invalid GitHub token - authentication failed")
+
+                data = await response.json()
+
+                errors = data.get("errors", [])
+                for error in errors:
+                    if error.get("type") == "INSUFFICIENT_SCOPES":
+                        msg = error.get("message", "")
+                        required = []
+                        current = []
+                        if "requires one of the following scopes:" in msg:
+                            import re
+                            req_match = re.search(r"requires one of the following scopes: \[([^\]]+)\]", msg)
+                            cur_match = re.search(r"only been granted the: \[([^\]]+)\]", msg)
+                            if req_match:
+                                required = [s.strip().strip("'") for s in req_match.group(1).split(",")]
+                            if cur_match:
+                                current = [s.strip().strip("'") for s in cur_match.group(1).split(",")]
+
+                        raise TokenScopeError(
+                            f"GitHub token lacks required scopes for promotion queries.\n"
+                            f"Required (one of): {required or ['read:user', 'user:email']}\n"
+                            f"Current scopes: {current or ['unknown']}\n"
+                            f"Please update your token at: https://github.com/settings/tokens",
+                            required_scopes=required or ["read:user", "user:email"],
+                            current_scopes=current,
+                        )
+
+                if "message" in data and "data" not in data:
+                    raise ValueError(f"GitHub API error: {data.get('message')}")
+
+                self._preflight_passed = True
+                logger.info("Preflight check passed - token has required scopes")
+
+        finally:
+            if close_session:
+                await session.close()
+
+    def _get_headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+
+    def _update_rate_limit(self, headers: Dict[str, str]) -> None:
+        try:
+            remaining = int(headers.get("X-RateLimit-Remaining", -1))
+            reset_ts = int(headers.get("X-RateLimit-Reset", 0))
+            limit = int(headers.get("X-RateLimit-Limit", 5000))
+
+            if remaining < 0 or reset_ts == 0:
+                return
+
+            self.rate_limit = RateLimitInfo(
+                remaining=remaining,
+                reset_at=datetime.fromtimestamp(reset_ts, tz=timezone.utc),
+                limit=limit,
+            )
+        except (ValueError, TypeError):
+            pass
+
+    def _parse_promotion_response(
+        self,
+        urls: List[str],
+        data: Dict[str, Any],
+    ) -> List[GitHubPromotionData]:
+        results = []
+
+        if "message" in data and "data" not in data:
+            error_msg = data.get("message", "api_error")
+            logger.error(f"GitHub API error: {error_msg}")
+            for url in urls:
+                results.append(GitHubPromotionData(url=url, fetch_error="api_error"))
+            return results
+
+        response_data = data.get("data") or {}
+
+        if not response_data:
+            logger.warning(f"Empty or null 'data' in GraphQL response. Full response keys: {list(data.keys())}")
+
+        for i, url in enumerate(urls):
+            repo_key = f"repo{i}"
+            repo_data = response_data.get(repo_key)
+
+            if repo_data is None:
+                results.append(GitHubPromotionData(url=url, fetch_error="not_found"))
+                continue
+
+            description = repo_data.get("description")
+
+            readme_content = None
+            for readme_key in ["readme_md", "readme_rst", "readme_txt", "readme_plain"]:
+                readme_obj = repo_data.get(readme_key)
+                if readme_obj and readme_obj.get("text"):
+                    readme_content = readme_obj["text"]
+                    if len(readme_content) > 1_000_000:
+                        readme_content = readme_content[:1_000_000]
+                    break
+
+            contributors = []
+            users_data = repo_data.get("mentionableUsers") or {}
+            for user in users_data.get("nodes") or []:
+                if user:
+                    contributors.append({
+                        "login": user.get("login"),
+                        "name": user.get("name"),
+                        "email": user.get("email"),
+                    })
+
+            results.append(GitHubPromotionData(
+                url=url,
+                description=description,
+                readme_content=readme_content,
+                contributors=contributors,
+            ))
+
+        return results
+
+    async def fetch_batch(
+        self,
+        urls: List[str],
+        session: aiohttp.ClientSession,
+    ) -> List[GitHubPromotionData]:
+        url_to_repo: Dict[str, Tuple[str, str]] = {}
+        results: List[GitHubPromotionData] = []
+
+        for url in urls:
+            parsed = parse_github_url(url)
+            if parsed is None:
+                results.append(GitHubPromotionData(url=url, fetch_error="invalid_url"))
+            else:
+                url_to_repo[url] = parsed
+
+        if not url_to_repo:
+            return results
+
+        repos = list(url_to_repo.values())
+        url_list = list(url_to_repo.keys())
+        query = build_promotion_query(repos)
+
+        for attempt in range(self.max_retries):
+            try:
+                async with session.post(
+                    GITHUB_GRAPHQL_URL,
+                    json={"query": query},
+                    headers=self._get_headers(),
+                ) as response:
+                    self._update_rate_limit(dict(response.headers))
+
+                    if response.status == 200:
+                        data = await response.json()
+                        return results + self._parse_promotion_response(url_list, data)
+                    elif response.status == 401:
+                        raise ValueError("Invalid GitHub token")
+                    elif response.status == 403:
+                        if self.rate_limit and self.rate_limit.remaining == 0:
+                            raise RateLimitExceeded(self.rate_limit)
+                    elif response.status >= 500:
+                        pass
+                    else:
+                        error_text = await response.text()
+                        logger.warning(f"GitHub API error {response.status}: {error_text}")
+
+                await asyncio.sleep(2 ** attempt)
+
+            except aiohttp.ClientError as e:
+                logger.warning(f"Network error on attempt {attempt + 1}: {e}")
+                await asyncio.sleep(2 ** attempt)
+
+        for url in url_list:
+            results.append(GitHubPromotionData(url=url, fetch_error="request_failed"))
+
+        return results
+
+    async def fetch_promotion_data(
+        self,
+        urls: List[str],
+        progress_callback=None,
+        batch_callback=None,
+        skip_preflight: bool = False,
+    ) -> List[GitHubPromotionData]:
+        """Raises TokenScopeError if token lacks required scopes (unless skip_preflight=True)."""
+        results: List[GitHubPromotionData] = []
+        total = len(urls)
+        last_batch_time = 0.0
+
+        async with aiohttp.ClientSession() as session:
+            if not skip_preflight and not self._preflight_passed:
+                await self.preflight_check(session)
+
+            for i in range(0, total, self.batch_size):
+                elapsed = time.monotonic() - last_batch_time
+                if elapsed < MIN_BATCH_INTERVAL and last_batch_time > 0:
+                    await asyncio.sleep(MIN_BATCH_INTERVAL - elapsed)
+
+                last_batch_time = time.monotonic()
+                batch = urls[i:i + self.batch_size]
+                batch_results = await self.fetch_batch(batch, session)
+                results.extend(batch_results)
+
+                if batch_callback:
+                    batch_callback(batch_results)
+
+                if progress_callback:
+                    progress_callback(len(results), total)
+
+        return results
+
+
+class GitHubGraphQLValidator:
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        batch_size: int = BATCH_SIZE,
+        max_retries: int = 3,
+    ):
+        self.token = token or os.environ.get("GITHUB_TOKEN")
+        if not self.token:
+            raise ValueError("GitHub token required. Set GITHUB_TOKEN environment variable.")
+
+        self.batch_size = batch_size
+        self.max_retries = max_retries
+        self.rate_limit: Optional[RateLimitInfo] = None
+
+    def _get_headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+
+    def _update_rate_limit(self, headers: Dict[str, str]) -> None:
+        try:
+            remaining = int(headers.get("X-RateLimit-Remaining", -1))
+            reset_ts = int(headers.get("X-RateLimit-Reset", 0))
+            limit = int(headers.get("X-RateLimit-Limit", 5000))
+
+            if remaining < 0 or reset_ts == 0:
+                return
+
+            self.rate_limit = RateLimitInfo(
+                remaining=remaining,
+                reset_at=datetime.fromtimestamp(reset_ts, tz=timezone.utc),
+                limit=limit,
+            )
+        except (ValueError, TypeError):
+            pass
+
+    async def validate_batch(
+        self,
+        urls: List[str],
+        session: aiohttp.ClientSession,
+    ) -> List[GitHubValidationResult]:
+        url_to_repo: Dict[str, Tuple[str, str]] = {}
+        results: List[GitHubValidationResult] = []
+
+        for url in urls:
+            parsed = parse_github_url(url)
+            if parsed is None:
+                results.append(GitHubValidationResult(url=url, valid=False, error="invalid_url"))
+            else:
+                url_to_repo[url] = parsed
+
+        if not url_to_repo:
+            return results
+
+        repos = list(url_to_repo.values())
+        url_list = list(url_to_repo.keys())
+        query = build_graphql_query(repos)
+
+        for attempt in range(self.max_retries):
+            try:
+                async with session.post(
+                    GITHUB_GRAPHQL_URL,
+                    json={"query": query},
+                    headers=self._get_headers(),
+                ) as response:
+                    self._update_rate_limit(dict(response.headers))
+
+                    if response.status == 200:
+                        data = await response.json()
+                        return self._parse_response(url_list, data, results)
+                    elif response.status == 401:
+                        raise ValueError("Invalid GitHub token")
+                    elif response.status == 403:
+                        if self.rate_limit and self.rate_limit.remaining == 0:
+                            raise RateLimitExceeded(self.rate_limit)
+                        error_text = await response.text()
+                        logger.warning(f"GitHub 403 (not rate limit): {error_text[:200]}")
+                    elif response.status >= 500:
+                        pass
+                    else:
+                        error_text = await response.text()
+                        logger.warning(f"GitHub API error {response.status}: {error_text}")
+
+                await asyncio.sleep(2 ** attempt)
+
+            except aiohttp.ClientError as e:
+                logger.warning(f"Network error on attempt {attempt + 1}: {e}")
+                await asyncio.sleep(2 ** attempt)
+
+        for url in url_list:
+            results.append(GitHubValidationResult(url=url, valid=False, error="request_failed"))
+
+        return results
+
+    def _parse_response(
+        self,
+        urls: List[str],
+        data: Dict[str, Any],
+        existing_results: List[GitHubValidationResult],
+    ) -> List[GitHubValidationResult]:
+        results = existing_results.copy()
+
+        if "message" in data and "data" not in data:
+            error_msg = data.get("message", "api_error")
+            logger.error(f"GitHub API error: {error_msg}")
+            for url in urls:
+                results.append(GitHubValidationResult(url=url, valid=False, error="api_error"))
+            return results
+
+        response_data = data.get("data") or {}
+        errors = data.get("errors", [])
+
+        if not response_data:
+            logger.warning(f"Empty or null 'data' in GraphQL response. Full response keys: {list(data.keys())}")
+
+        error_lookup: Dict[str, str] = {}
+        for error in errors:
+            path = error.get("path", [])
+            if path:
+                error_lookup[path[0]] = error.get("type", "error")
+
+        for i, url in enumerate(urls):
+            repo_key = f"repo{i}"
+            repo_data = response_data.get(repo_key)
+
+            if repo_data is not None:
+                results.append(GitHubValidationResult(url=url, valid=True))
+            else:
+                error_type = error_lookup.get(repo_key, "not_found")
+                results.append(GitHubValidationResult(url=url, valid=False, error=error_type))
+
+        return results
+
+    async def validate_urls(
+        self,
+        urls: List[str],
+        progress_callback=None,
+        batch_callback=None,
+    ) -> List[GitHubValidationResult]:
+        results: List[GitHubValidationResult] = []
+        total = len(urls)
+        last_batch_time = 0.0
+
+        async with aiohttp.ClientSession() as session:
+            for i in range(0, total, self.batch_size):
+                elapsed = time.monotonic() - last_batch_time
+                if elapsed < MIN_BATCH_INTERVAL and last_batch_time > 0:
+                    await asyncio.sleep(MIN_BATCH_INTERVAL - elapsed)
+
+                last_batch_time = time.monotonic()
+                batch = urls[i:i + self.batch_size]
+                batch_results = await self.validate_batch(batch, session)
+                results.extend(batch_results)
+
+                if batch_callback:
+                    batch_callback(batch_results)
+
+                if progress_callback:
+                    progress_callback(len(results), total)
+
+        return results
+
+
+class RateLimitExceeded(Exception):
+    def __init__(self, rate_limit: RateLimitInfo):
+        self.rate_limit = rate_limit
+        super().__init__(f"Rate limit exceeded. Resets at {rate_limit.reset_at}")

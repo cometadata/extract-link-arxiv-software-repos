@@ -1,0 +1,512 @@
+"""Promotion engine for upgrading repo links to isSupplementedBy."""
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
+
+from .github_graphql import GitHubPromotionFetcher, GitHubPromotionData, parse_github_url
+from .heuristics.arxiv_detection import ArxivDetectionResult, detect_arxiv_id
+from .heuristics.name_similarity import NameSimilarityResult, compute_name_similarity
+from .heuristics.author_matching import (
+    AuthorMatchResult,
+    ContributorInfo,
+    match_authors_to_contributors,
+    load_author_matching_model,
+)
+from .paper_records import PaperInfo, normalize_doi
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PromotionResult:
+    promoted: bool
+    signals: List[str] = field(default_factory=list)
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    original_relation: str = "References"
+    skipped: bool = False
+    skip_reason: Optional[str] = None
+
+
+def evaluate_promotion(
+    arxiv_result: ArxivDetectionResult,
+    name_result: NameSimilarityResult,
+    author_result: AuthorMatchResult,
+    threshold: int = 2,
+) -> PromotionResult:
+    signals = []
+    evidence = {}
+
+    if arxiv_result.matched:
+        signals.append(f"arxiv_id_in_{arxiv_result.location}")
+        evidence["arxiv_id_found"] = arxiv_result.found_id
+        evidence["arxiv_id_location"] = arxiv_result.location
+    elif arxiv_result.skipped:
+        evidence["arxiv_skipped"] = arxiv_result.skip_reason
+
+    if name_result.matched:
+        signals.append("name_similarity")
+    evidence["name_similarity_score"] = name_result.score
+    evidence["name_containment_score"] = name_result.containment_score
+    evidence["name_token_overlap_score"] = name_result.token_overlap_score
+    evidence["name_fuzzy_score"] = name_result.fuzzy_score
+    if name_result.skipped:
+        evidence["name_skipped"] = name_result.skip_reason
+
+    if author_result.matched:
+        signals.append("author_match")
+        evidence["author_matches"] = [
+            {
+                "contributor": m.contributor_login,
+                "author": m.author_name,
+                "confidence": m.confidence,
+            }
+            for m in author_result.matches
+        ]
+    elif author_result.skipped:
+        evidence["author_skipped"] = author_result.skip_reason
+
+    return PromotionResult(
+        promoted=len(signals) >= threshold,
+        signals=signals,
+        evidence=evidence,
+    )
+
+
+class PromotionEngine:
+    def __init__(
+        self,
+        github_token: Optional[str] = None,
+        promotion_threshold: int = 2,
+        name_similarity_threshold: float = 0.45,
+        batch_size: int = 50,
+    ):
+        self.github_token = github_token
+        self.promotion_threshold = promotion_threshold
+        self.name_similarity_threshold = name_similarity_threshold
+        self.batch_size = batch_size
+        self._author_model = None
+
+    def _build_paper_index(self, papers: List[PaperInfo]) -> Dict[str, PaperInfo]:
+        index = {}
+        for paper in papers:
+            if paper.doi:
+                normalized = normalize_doi(paper.doi)
+                index[normalized] = paper
+        return index
+
+    def _filter_promotable_records(
+        self,
+        records: List[Dict[str, Any]],
+        paper_index: Dict[str, PaperInfo],
+    ) -> List[Dict[str, Any]]:
+        promotable = []
+        for record in records:
+            validation = record.get("_validation", {})
+            if not validation.get("is_valid"):
+                continue
+
+            url = record.get("enrichedValue", {}).get("relatedIdentifier", "")
+            if not parse_github_url(url):
+                continue
+
+            doi = record.get("doi", "")
+            if doi:
+                normalized_doi = normalize_doi(doi)
+                if normalized_doi in paper_index:
+                    promotable.append(record)
+
+        return promotable
+
+    def _get_author_model(self):
+        if self._author_model is None:
+            self._author_model = load_author_matching_model()
+        return self._author_model
+
+    def _evaluate_record(
+        self,
+        record: Dict[str, Any],
+        paper: PaperInfo,
+        promotion_data: GitHubPromotionData,
+    ) -> PromotionResult:
+        url = record.get("enrichedValue", {}).get("relatedIdentifier", "")
+        parsed = parse_github_url(url)
+        repo_name = parsed[1] if parsed else None
+
+        arxiv_result = detect_arxiv_id(
+            paper_arxiv_id=paper.arxiv_id,
+            readme_content=promotion_data.readme_content,
+            description=promotion_data.description,
+        )
+
+        name_result = compute_name_similarity(
+            repo_name=repo_name,
+            paper_title=paper.title,
+            threshold=self.name_similarity_threshold,
+        )
+
+        contributors = [
+            ContributorInfo(
+                login=c["login"],
+                name=c.get("name"),
+                email=c.get("email"),
+            )
+            for c in promotion_data.contributors
+            if c.get("login")
+        ]
+        author_result = match_authors_to_contributors(
+            contributors=contributors,
+            paper_authors=paper.authors,
+            loaded_model=self._get_author_model(),
+        )
+
+        return evaluate_promotion(
+            arxiv_result=arxiv_result,
+            name_result=name_result,
+            author_result=author_result,
+            threshold=self.promotion_threshold,
+        )
+
+    async def promote_records(
+        self,
+        records: List[Dict[str, Any]],
+        papers: List[PaperInfo],
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        cached_github_data: Optional[Dict[str, GitHubPromotionData]] = None,
+        github_data_callback: Optional[Callable[[List[GitHubPromotionData]], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return updated records with _promotion field and updated relationType."""
+        paper_index = self._build_paper_index(papers)
+        logger.info(f"Built paper index with {len(paper_index)} entries")
+
+        promotable = self._filter_promotable_records(records, paper_index)
+        logger.info(f"Found {len(promotable)} promotable records out of {len(records)}")
+
+        if not promotable:
+            return records
+
+        all_urls = list(set(
+            r.get("enrichedValue", {}).get("relatedIdentifier", "")
+            for r in promotable
+        ))
+
+        url_to_data = dict(cached_github_data) if cached_github_data else {}
+        urls_to_fetch = [u for u in all_urls if u not in url_to_data]
+
+        if urls_to_fetch:
+            logger.info(f"Fetching {len(urls_to_fetch)} URLs ({len(all_urls) - len(urls_to_fetch)} cached)")
+            fetcher = GitHubPromotionFetcher(token=self.github_token, batch_size=self.batch_size)
+
+            def github_progress(completed, total):
+                if progress_callback:
+                    progress_callback("Fetching GitHub data", completed, total)
+
+            def batch_callback(batch_results):
+                if github_data_callback:
+                    github_data_callback(batch_results)
+
+            new_data = await fetcher.fetch_promotion_data(
+                urls_to_fetch,
+                progress_callback=github_progress,
+                batch_callback=batch_callback,
+            )
+            for d in new_data:
+                url_to_data[d.url] = d
+        else:
+            logger.info(f"All {len(all_urls)} URLs found in cache")
+
+        results = {}
+        total_to_evaluate = len(promotable)
+
+        for i, record in enumerate(promotable):
+            url = record.get("enrichedValue", {}).get("relatedIdentifier", "")
+
+            if url in results:
+                continue
+
+            doi = normalize_doi(record.get("doi", ""))
+            paper = paper_index.get(doi)
+            promotion_data = url_to_data.get(url)
+
+            if paper and promotion_data and not promotion_data.fetch_error:
+                result = self._evaluate_record(record, paper, promotion_data)
+                results[url] = result
+            else:
+                results[url] = PromotionResult(
+                    promoted=False,
+                    skipped=True,
+                    skip_reason=promotion_data.fetch_error if promotion_data else "no_promotion_data",
+                )
+
+            if progress_callback:
+                progress_callback("Evaluating heuristics", i + 1, total_to_evaluate)
+
+        output_records = []
+        promoted_count = 0
+
+        for record in records:
+            url = record.get("enrichedValue", {}).get("relatedIdentifier", "")
+            result = results.get(url)
+
+            if result:
+                original_relation = record.get("enrichedValue", {}).get("relationType", "References")
+                result.original_relation = original_relation
+
+                record["_promotion"] = {
+                    "promoted": result.promoted,
+                    "original_relation": original_relation,
+                    "signals": result.signals,
+                    "evidence": result.evidence,
+                }
+
+                if result.promoted:
+                    record["enrichedValue"]["relationType"] = "isSupplementedBy"
+                    promoted_count += 1
+
+            output_records.append(record)
+
+        logger.info(f"Promoted {promoted_count} records to isSupplementedBy")
+        return output_records
+
+    def promote_records_sync(
+        self,
+        records: List[Dict[str, Any]],
+        papers: List[PaperInfo],
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        cached_github_data: Optional[Dict[str, GitHubPromotionData]] = None,
+        github_data_callback: Optional[Callable[[List[GitHubPromotionData]], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        return asyncio.run(self.promote_records(
+            records, papers, progress_callback, cached_github_data, github_data_callback
+        ))
+
+
+class BatchPromotionEngine:
+    def __init__(
+        self,
+        promotion_threshold: int = 2,
+        name_similarity_threshold: float = 0.45,
+        chunk_size: int = 1000,
+        model_batch_size: int = 256,
+    ):
+        self.promotion_threshold = promotion_threshold
+        self.name_similarity_threshold = name_similarity_threshold
+        self.chunk_size = chunk_size
+        self.model_batch_size = model_batch_size
+        self._author_model = None
+
+    def _get_author_model(self):
+        if self._author_model is None:
+            self._author_model = load_author_matching_model()
+        return self._author_model
+
+    def _build_evidence(
+        self,
+        arxiv_result: ArxivDetectionResult,
+        name_result: NameSimilarityResult,
+        author_result: Optional[AuthorMatchResult],
+    ) -> Dict[str, Any]:
+        evidence = {}
+
+        if arxiv_result.matched:
+            evidence["arxiv_id_found"] = arxiv_result.found_id
+            evidence["arxiv_id_location"] = arxiv_result.location
+        elif arxiv_result.skipped:
+            evidence["arxiv_skipped"] = arxiv_result.skip_reason
+
+        evidence["name_similarity_score"] = name_result.score
+        evidence["name_containment_score"] = name_result.containment_score
+        evidence["name_token_overlap_score"] = name_result.token_overlap_score
+        evidence["name_fuzzy_score"] = name_result.fuzzy_score
+        if name_result.skipped:
+            evidence["name_skipped"] = name_result.skip_reason
+
+        if author_result:
+            if author_result.matched:
+                evidence["author_matches"] = [
+                    {
+                        "contributor": m.contributor_login,
+                        "author": m.author_name,
+                        "confidence": m.confidence,
+                    }
+                    for m in author_result.matches
+                ]
+            elif author_result.skipped:
+                evidence["author_skipped"] = author_result.skip_reason
+
+        return evidence
+
+    def _evaluate_fast_heuristics(
+        self,
+        url: str,
+        paper: PaperInfo,
+        promotion_data: GitHubPromotionData,
+    ) -> tuple:
+        """Return (fast_signals, arxiv_result, name_result, needs_author_matching)."""
+        parsed = parse_github_url(url)
+        repo_name = parsed[1] if parsed else None
+
+        arxiv_result = detect_arxiv_id(
+            paper_arxiv_id=paper.arxiv_id,
+            readme_content=promotion_data.readme_content,
+            description=promotion_data.description,
+        )
+
+        name_result = compute_name_similarity(
+            repo_name=repo_name,
+            paper_title=paper.title,
+            threshold=self.name_similarity_threshold,
+        )
+
+        fast_signals = []
+        if arxiv_result.matched:
+            fast_signals.append(f"arxiv_id_in_{arxiv_result.location}")
+        if name_result.matched:
+            fast_signals.append("name_similarity")
+
+        if len(fast_signals) >= self.promotion_threshold:
+            # Already have enough signals
+            needs_author = False
+        elif len(fast_signals) + 1 >= self.promotion_threshold:
+            # Could reach threshold with author match
+            needs_author = True
+        else:
+            # Can't reach threshold even with author match
+            needs_author = False
+
+        return fast_signals, arxiv_result, name_result, needs_author
+
+    def process_chunk(
+        self,
+        chunk: List[Dict[str, Any]],
+        paper_index: Dict[str, PaperInfo],
+        github_data: Dict[str, GitHubPromotionData],
+        promoted_urls: set,
+    ) -> int:
+        """Mutates promoted_urls in place. Returns number promoted in this chunk."""
+        from .heuristics.author_matching import batch_match_authors, ContributorInfo
+
+        fast_results = {}  # (url, doi) -> (signals, arxiv, name)
+        needs_author_matching = []  # Records that need author matching
+
+        for record in chunk:
+            url = record.get("enrichedValue", {}).get("relatedIdentifier", "")
+
+            # Skip non-GitHub URLs
+            if "github.com" not in url.lower():
+                continue
+
+            # Skip already promoted URLs
+            if url in promoted_urls:
+                record["_promotion"] = {
+                    "promoted": False,
+                    "skipped": True,
+                    "skip_reason": "url_already_promoted",
+                }
+                continue
+
+            # Check for required data
+            doi = normalize_doi(record.get("doi", ""))
+            paper = paper_index.get(doi)
+            promotion_data = github_data.get(url)
+
+            if not paper:
+                record["_promotion"] = {
+                    "promoted": False,
+                    "skipped": True,
+                    "skip_reason": "no_paper_record",
+                }
+                continue
+
+            if not promotion_data or promotion_data.fetch_error:
+                record["_promotion"] = {
+                    "promoted": False,
+                    "skipped": True,
+                    "skip_reason": promotion_data.fetch_error if promotion_data else "no_promotion_data",
+                }
+                continue
+
+            # Run fast heuristics
+            fast_signals, arxiv_result, name_result, needs_author = self._evaluate_fast_heuristics(
+                url, paper, promotion_data
+            )
+
+            key = (url, doi)
+            fast_results[key] = (fast_signals, arxiv_result, name_result)
+
+            if needs_author:
+                contributors = [
+                    ContributorInfo(
+                        login=c["login"],
+                        name=c.get("name"),
+                        email=c.get("email"),
+                    )
+                    for c in promotion_data.contributors
+                    if c.get("login")
+                ]
+                needs_author_matching.append({
+                    "key": key,
+                    "contributors": contributors,
+                    "authors": paper.authors,
+                })
+
+        author_results = {}
+        if needs_author_matching:
+            author_results = batch_match_authors(
+                needs_author_matching,
+                model=self._get_author_model(),
+                model_batch_size=self.model_batch_size,
+            )
+
+        promoted_count = 0
+
+        for record in chunk:
+            url = record.get("enrichedValue", {}).get("relatedIdentifier", "")
+
+            # Skip if already processed (non-GitHub, already promoted, missing data)
+            if "_promotion" in record:
+                continue
+
+            if "github.com" not in url.lower():
+                continue
+
+            # Check if URL was promoted earlier in THIS chunk
+            if url in promoted_urls:
+                record["_promotion"] = {
+                    "promoted": False,
+                    "skipped": True,
+                    "skip_reason": "url_already_promoted",
+                }
+                continue
+
+            doi = normalize_doi(record.get("doi", ""))
+            key = (url, doi)
+
+            if key not in fast_results:
+                continue
+
+            fast_signals, arxiv_result, name_result = fast_results[key]
+            author_result = author_results.get(key)
+
+            # Compute final signals
+            signals = list(fast_signals)
+            if author_result and author_result.matched:
+                signals.append("author_match")
+
+            promoted = len(signals) >= self.promotion_threshold
+            original_relation = record.get("enrichedValue", {}).get("relationType", "References")
+
+            record["_promotion"] = {
+                "promoted": promoted,
+                "original_relation": original_relation,
+                "signals": signals,
+                "evidence": self._build_evidence(arxiv_result, name_result, author_result),
+            }
+
+            if promoted:
+                record["enrichedValue"]["relationType"] = "IsSupplementedBy"
+                promoted_urls.add(url)
+                promoted_count += 1
+
+        return promoted_count
