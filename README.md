@@ -1,4 +1,4 @@
-# extract-software-repos
+# extract-link-arxiv-software-repos
 
 Extract and validate software repository URLs from scientific papers, identifying official implementations by matching paper authors to repository contributors. Author matching model derived from [sci-soft-models](https://github.com/evamaxfield/sci-soft-models) by Eva Maxfield Brown ([doi:10.5281/zenodo.17401862](https://doi.org/10.5281/zenodo.17401862)), as described in [Code Contribution and Credit in Science](https://doi.org/10.48550/arXiv.2510.16242).
 
